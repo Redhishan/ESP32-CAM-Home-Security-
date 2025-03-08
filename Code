@@ -324,5 +324,4 @@ void handleStatusRequest() {
 
 void triggerAlarmSequence() {
   Serial.println("Security breach detected!");
-  // Add notification logic here (email, buzzer, etc.)
 }
