@@ -1,0 +1,328 @@
+#include <WiFi.h>
+#include <esp_camera.h>
+#include <WebServer.h>
+#include <fauxmoESP.h>
+#include <DHT.h>
+#include <ArduinoOTA.h>
+#include <esp_heap_caps.h>
+
+// Configuration
+const char* SSID = "YOUR_SSID";
+const char* PASSWORD = "YOUR_PASSWORD";
+const unsigned long WIFI_TIMEOUT = 30000;
+
+// Hardware Pins (Updated for ESP32-CAM compatibility)
+#define PIR_PIN     14  // GPIO14 (Avoid 12,13,4)
+#define DHT_PIN     15  // GPIO15 (If SD card not used)
+#define TRIG_PIN    2   // GPIO2 (Keep HIGH during boot)
+#define ECHO_PIN    0   // GPIO0 (Requires pull-up)
+#define DHT_TYPE    DHT11
+
+// Security Parameters
+#define MOTION_HISTORY 5
+#define MAX_DISTANCE 200
+#define SENSOR_RETRIES 3
+#define FRAME_SKIP 2
+
+enum SystemState { DISARMED, ARMED, TRIGGERED };
+SystemState systemState = DISARMED;
+
+// Motion Detection
+struct {
+  uint8_t *prevFrame = nullptr;
+  float baseLine = 25.0;
+  bool motionHistory[MOTION_HISTORY] = {0};
+  unsigned long lastTrigger = 0;
+} motion;
+
+// Sensor Data
+struct {
+  float temperature = NAN;
+  float humidity = NAN;
+  float distance = NAN;
+  unsigned long lastRead = 0;
+} sensors;
+
+WebServer server(80);
+fauxmoESP fauxmo;
+DHT dht(DHT_PIN, DHT_TYPE);
+
+void setup() {
+  Serial.begin(115200);
+  configurePins();
+  initializeCamera();
+  connectWiFi();
+  configureOTA();
+  configureWebServer();
+  configureAlexa();
+  dht.begin();
+}
+
+void loop() {
+  ArduinoOTA.handle();
+  fauxmo.handle();
+  server.handleClient();
+  
+  if(systemState == ARMED) {
+    checkMotionSensors();
+    checkEnvironmentalSensors();
+  }
+  
+  maintainSystemHealth();
+}
+
+void configurePins() {
+  pinMode(PIR_PIN, INPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT_PULLUP);  // Add pull-up for GPIO0
+  digitalWrite(TRIG_PIN, LOW);
+  delay(100);  // Ensure pins stabilize
+}
+
+camera_config_t getCameraConfig() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = 5;
+  config.pin_d1 = 18;
+  config.pin_d2 = 19;
+  config.pin_d3 = 21;
+  config.pin_d4 = 36;
+  config.pin_d5 = 39;
+  config.pin_d6 = 34;
+  config.pin_d7 = 35;
+  config.pin_xclk = 0;
+  config.pin_pclk = 22;
+  config.pin_vsync = 25;
+  config.pin_href = 23;
+  config.pin_sscb_sda = 26;
+  config.pin_sscb_scl = 27;
+  config.pin_pwdn = 32;
+  config.pin_reset = -1;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 2;  // Double buffering
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  return config;
+}
+
+void initializeCamera() {
+  camera_config_t config = getCameraConfig();
+  esp_err_t err = ESP_FAIL;
+  
+  for(int i = 0; i < 3; i++) {
+    err = esp_camera_init(&config);
+    if (err == ESP_OK) break;
+    Serial.printf("Camera init attempt %d failed: 0x%x\n", i+1, err);
+    delay(1000);
+  }
+  
+  if (err != ESP_OK) {
+    Serial.println("Camera initialization failed! System disabled");
+    systemState = DISARMED;
+    return;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if(s) {
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_pixformat(s, PIXFORMAT_GRAYSCALE);
+  }
+}
+
+void connectWiFi() {
+  WiFi.begin(SSID, PASSWORD);
+  unsigned long start = millis();
+  
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT) {
+    delay(250);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\nWiFi connection failed!");
+    systemState = DISARMED;
+  }
+}
+
+void configureOTA() {
+  ArduinoOTA.setHostname("esp32cam-security");
+  ArduinoOTA.begin();
+}
+
+bool initializeFrameBuffer(camera_fb_t *fb) {
+  if (!motion.prevFrame) {
+    motion.prevFrame = (uint8_t*)heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM);
+    if (!motion.prevFrame) {
+      Serial.println("Failed to allocate PSRAM for motion detection");
+      return false;
+    }
+    memcpy(motion.prevFrame, fb->buf, fb->len);
+  }
+  return true;
+}
+
+float calculateMotionLevel(camera_fb_t *fb) {
+  float diffSum = 0;
+  size_t len = fb->width * fb->height;
+  
+  for(size_t i = 0; i < len; i += FRAME_SKIP) {
+    diffSum += abs(fb->buf[i] - motion.prevFrame[i]);
+  }
+  memcpy(motion.prevFrame, fb->buf, len);
+  
+  return (diffSum / (len / FRAME_SKIP)) * 100 / 255;
+}
+
+void updateMotionHistory(float motionLevel) {
+  for(int i = MOTION_HISTORY-1; i > 0; i--) {
+    motion.motionHistory[i] = motion.motionHistory[i-1];
+  }
+  motion.motionHistory[0] = (motionLevel > motion.baseLine);
+}
+
+bool checkConsistentMotion() {
+  int triggerCount = 0;
+  for(bool state : motion.motionHistory) {
+    if(state) triggerCount++;
+  }
+  return triggerCount >= MOTION_HISTORY-2;
+}
+
+float readUltrasonic() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout (~5m max)
+  return (duration > 0) ? duration * 0.034 / 2 : NAN;
+}
+
+bool validateMultiSensor() {
+  for(int i = 0; i < SENSOR_RETRIES; i++) {
+    bool pirState = digitalRead(PIR_PIN);
+    float distance = readUltrasonic();
+    
+    if(pirState && (distance < MAX_DISTANCE || isnan(distance))) {
+      return true;
+    }
+    delay(50);
+  }
+  return false;
+}
+
+void checkMotionSensors() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 250) return;
+  lastCheck = millis();
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb || fb->format != PIXFORMAT_GRAYSCALE) {
+    if(fb) esp_camera_fb_return(fb);
+    return;
+  }
+
+  if (!initializeFrameBuffer(fb)) {
+    esp_camera_fb_return(fb);
+    return;
+  }
+
+  float motionLevel = calculateMotionLevel(fb);
+  updateMotionHistory(motionLevel);
+  esp_camera_fb_return(fb);
+
+  if (checkConsistentMotion() && validateMultiSensor()) {
+    systemState = TRIGGERED;
+    motion.lastTrigger = millis();
+    triggerAlarmSequence();
+  }
+}
+
+void checkEnvironmentalSensors() {
+  static unsigned long lastRead = 0;
+  if (millis() - lastRead < 2000) return;
+  
+  sensors.temperature = readSensorWithRetry([]() { return dht.readTemperature(); });
+  sensors.humidity = readSensorWithRetry([]() { return dht.readHumidity(); });
+  sensors.distance = readUltrasonic();
+  
+  lastRead = millis();
+}
+
+template<typename T>
+T readSensorWithRetry(T (*readFunc)(), uint8_t retries = SENSOR_RETRIES) {
+  T value;
+  for(uint8_t i = 0; i < retries; i++) {
+    value = readFunc();
+    if(!isnan(value)) break;
+    delay(50);
+  }
+  return value;
+}
+
+void maintainSystemHealth() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 10000) return;
+
+  verifyMemory();
+  checkWiFiConnection();
+  lastCheck = millis();
+}
+
+void verifyMemory() {
+  size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  if (freePsram < 1024) {
+    Serial.printf("Low PSRAM: %u bytes\n", freePsram);
+  }
+}
+
+void checkWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection lost! Reconnecting...");
+    WiFi.disconnect();
+    WiFi.begin(SSID, PASSWORD);
+    delay(5000);
+  }
+}
+
+void configureAlexa() {
+  fauxmo.createServer(true); // Use existing server
+  fauxmo.setPort(80);
+  fauxmo.enable(true);
+  fauxmo.addDevice("security_system");
+
+  fauxmo.onSetState([](unsigned char device_id, const char *device_name, bool state) {
+    systemState = state ? ARMED : DISARMED;
+    Serial.printf("System %s\n", state ? "Armed" : "Disarmed");
+  });
+}
+
+void configureWebServer() {
+  server.on("/status", HTTP_GET, handleStatusRequest);
+  server.onNotFound([]() { fauxmo.handle(server.client()); });
+  server.begin();
+}
+
+void handleStatusRequest() {
+  String temp = isnan(sensors.temperature) ? "null" : String(sensors.temperature, 1);
+  String hum = isnan(sensors.humidity) ? "null" : String(sensors.humidity, 1);
+  String dist = isnan(sensors.distance) ? "null" : String(sensors.distance, 1);
+  
+  String json = "{\"armed\":" + String(systemState == ARMED ? "true" : "false") 
+    + ",\"temperature\":" + temp 
+    + ",\"humidity\":" + hum 
+    + ",\"distance\":" + dist + "}";
+  
+  server.send(200, "application/json", json);
+}
+
+void triggerAlarmSequence() {
+  Serial.println("Security breach detected!");
+  // Add notification logic here (email, buzzer, etc.)
+}
